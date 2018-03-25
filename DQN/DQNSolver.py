@@ -22,7 +22,7 @@ from builtins import str
 
 class DQNSolver:
     
-    def __init__(self, env_name="Snake-v0", max_mem=100000, observetime=500, n_episodes=1000, n_win_ticks=195, 
+    def __init__(self, env_name="Snake-v0", max_mem=100000, target_update_freq=10, observetime=500, n_episodes=1000, n_win_ticks=195, 
                  max_env_steps=None, gamma=0.9, epsilon=1.0, epsilon_min=0.1, 
                  epsilon_log_decay=0.995, alpha=0.01, alpha_decay=0.01, batch_size=32, monitor=False, quiet=False, 
                  reward_func=RewardFunction()):
@@ -42,20 +42,26 @@ class DQNSolver:
         self.batch_size = batch_size
         self.quiet = quiet
         if max_env_steps is not None: self.env._max_episode_steps = max_env_steps
+        
         self.model = None
+        self.target_update_freq = target_update_freq
+        self.target_model = None
         self.reward_func = reward_func
         self.episode_runs = 0
 
     def save(self, agent_path):
         model = self.model
+        target_model = self.target_model
         env = self.env
         self.model = None # can't be unpickled
+        self.target_model = None # can't be unpickled
         self.env = None # can't be unpickled
         
         with open(agent_path, 'wb') as f:
             pickle.dump(self, f, 0)
             
         self.model = model
+        self.target_model = target_model
         self.env = env
 
     @staticmethod
@@ -64,6 +70,14 @@ class DQNSolver:
             agent = pickle.load(f)
             agent.env = gym.make(agent.env_name)
             return agent
+        
+    def summary(self):
+        print("Episodes:", self.n_episodes)
+        print("Episode runs:", self.episode_runs)
+        print("Exploring rate:", self.epsilon)
+        print("Reward discount:", self.gamma)
+        print("Memory length:", len(self.memory))
+        print("Memory max length:", self.memory.maxlen)
         
     def _confirm_model_load(self):
         if self.model:
@@ -85,12 +99,17 @@ class DQNSolver:
                 ext = os.path.splitext(model)[-1]
                 if ext == ".h5":
                     self.model = keras.models.load_model(model)
+                    
                 elif ext == ".json":
                     with open(model) as f:
                         self.model = model_from_json(json.load(f))
                         self.model.compile(loss='mse', optimizer=Adam(lr=self.alpha, decay=self.alpha_decay))
                 else:
                     raise Exception("Loading model '{}' failed".format(model))
+                
+            if self.target_update_freq:
+                self.target_model = keras.models.clone_model(self.model)
+                self.target_model.set_weights(self.model.get_weights())
     
     def action_to_str_snake(self, action):
         actions = ["UP", "LEFT", "RIGHT", "DOWN", "NO_ACTION"]
@@ -100,6 +119,8 @@ class DQNSolver:
         return DQNModel.get_layer_outputs(self.model, state)
         
     def predict(self, state):
+        """Returns action (int)
+        """
         pred = self.model.predict(state)
         #print(pred[0])
         return np.argmax(pred)
@@ -116,27 +137,17 @@ class DQNSolver:
         #return max(self.epsilon_min, min(self.epsilon, 1.0 - math.log10((t + 1) * self.epsilon_decay)))
         return max(self.epsilon_min, self.epsilon)
 
+    def target_q(self, next_state):
+        if self.target_model:
+            return np.max(self.target_model.predict(next_state)[0])
+        else:
+            return np.max(self.model.predict(next_state)[0])
+                      
     def preprocess_state(self, state):
         """Scale pixels and reshape
         """
         state[...] = state[...]/255 
         return state.reshape((1,) + self.model.input_shape[1:])
-
-    def replay(self, batch_size):
-        """Fit the model with batches from the memory
-        """
-        x_batch, y_batch = [], []
-        minibatch = random.sample(
-            self.memory, min(len(self.memory), batch_size))
-        for state, action, reward, next_state, done in minibatch:
-            y_target = self.model.predict(state)
-            y_target[0][action] = reward if done else reward + self.gamma * np.max(self.model.predict(next_state)[0])
-            x_batch.append(state[0])
-            y_batch.append(y_target[0])
-        
-        self.model.fit(np.array(x_batch), np.array(y_batch), batch_size=len(x_batch), verbose=0)
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
             
     def play(self, render=False, n_games=1):
         """Plays specified number of games and print the accumulated reward
@@ -180,8 +191,26 @@ class DQNSolver:
             input()
             index += 1
         print("Total reward:", tot_reward)
+    
+    def replay(self, batch_size):
+        """Fit the model with batches from the memory
+        """
+        x_batch, y_batch = [], []
+        minibatch = random.sample(self.memory, min(len(self.memory), batch_size))
+        for state, action, reward, next_state, done in minibatch:
+            y_target = self.model.predict(state)
+            #y_target[0][action] = reward if done else reward + self.gamma * np.max(self.model.predict(next_state)[0])
+            y_target[0][action] = reward if done else reward + self.gamma * self.target_q(next_state)
+            x_batch.append(state[0])
+            y_batch.append(y_target[0])
         
-    def train_play(self, episode, render=False, remember=False, observetime=500):
+        self.model.fit(np.array(x_batch), np.array(y_batch), batch_size=len(x_batch), verbose=0)
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+            if self.epsilon < self.epsilon_min:
+                self.epsilon = self.epsilon_min
+        
+    def explore_replay(self, episode, replay=True, render=False, remember=False, observetime=500, break_on_done=True):
         """Trial and error playing which will be stored in memory
         """
         state = self.preprocess_state(self.env.reset())
@@ -197,8 +226,12 @@ class DQNSolver:
             next_state = self.preprocess_state(next_state)
             if remember: self.remember(state, action, reward, next_state, done)
             state = next_state
+            
+            #if replay: self.replay(self.batch_size)
             #i += 1
             if done:
+                if break_on_done:
+                    break
                 state = self.preprocess_state(self.env.reset())
                 done = False
                 #i = 0
@@ -211,26 +244,33 @@ class DQNSolver:
         if n_episodes is not None: 
             self.n_episodes = n_episodes
         all_rewards = deque(maxlen=100)
-        mem_index = deque(maxlen=100)
         
         # Initialize memory with 5000 observations
-        print("Initializing memory...")
-        self.train_play(0, observetime=5000)
-        print("Initialize complete")
+        if not len(self.memory) >= 1000:
+            print("Initializing memory...")
+            self.explore_replay(0, replay=False, observetime=1000, break_on_done=False)
+            print("Initialize complete")
+        else:
+            print("Initialization not needed")
         
         for e in range(1, self.n_episodes+1):
-            mem_index.append(len(self.memory))
-            self.train_play(e, remember=True, observetime=self.observetime)
-            self.replay(self.batch_size)
+            self.episode_runs += 1
+            
+            self.explore_replay(e, remember=True, observetime=self.observetime)
+            self.replay(self.batch_size)###
+            # Update target network
+            if self.target_model and (self.episode_runs % self.target_update_freq == 0):
+                self.target_model.set_weights(self.model.get_weights())
+                print("Updated target network")
             
             if play: 
                 rewards = self.play() # Play once every episode to check performance
                 all_rewards.extend(rewards)
             mean_score = np.mean(all_rewards)
             
-            self.episode_runs += 1
-            if e % 100 == 0 and not self.quiet:
+            if e % 10 == 0 and not self.quiet:
                 print('[Episode {}] - Mean accumulated reward over last 100 episodes was {}.'.format(self.episode_runs, mean_score))
+            if e % 100 == 0 and not self.quiet:    
                 print("Best game score from last 100 games:", np.max(all_rewards))
             
         if not self.quiet: print('Did not solve after {} episodes 😞'.format(e))
