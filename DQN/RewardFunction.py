@@ -9,9 +9,9 @@ class RewardFunction:
         #        reward = self.reward_mapping(t-1)
         # Just for snake
         if reward == 0:
-            reward = -1
+            reward = 1
         elif reward == 1:
-            reward = 100
+            reward = 20
         elif reward == -5:
             reward = -100
         return reward
